@@ -260,7 +260,14 @@ class BinaryVectorStore:
         }
     
     def close(self):
-        """Close database connection."""
+        """Close database connection.
+
+        Only the owner closes: when this store rides a caller-supplied
+        handle (``_owns_connection`` False), closing here would kill a
+        shared handle the store does not own (mnemosyne#1163).
+        """
+        if not getattr(self, "_owns_connection", False):
+            return
         self.conn.close()
 
 

@@ -209,6 +209,22 @@ class TestC4ExternalAndSubstores:
         peer.close()
         f.close()
 
+    def test_binary_vectors_close_guards_shared_handle(self, tmp_path):
+        from mnemosyne.core.binary_vectors import BinaryVectorStore
+
+        db = tmp_path / "bv.db"
+        shared = sqlite3.connect(str(db))
+        bvs = BinaryVectorStore(conn=shared, db_path=db)
+        assert bvs._owns_connection is False
+        try:
+            bvs.close()  # must be a no-op on a shared handle
+            assert _usable(shared)
+        finally:
+            shared.close()
+        owner = BinaryVectorStore(db_path=tmp_path / "bv-own.db")
+        owner.close()
+        assert not _usable(owner.conn)
+
 
 # ----------------------------------------------------- displaced / gc ----
 class TestDisplacedAliasesAndGcParity:
