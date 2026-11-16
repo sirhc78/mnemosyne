@@ -232,27 +232,33 @@ class TestDisplacedAliasesAndGcParity:
 
     def test_abandoned_facade_releases_by_gc(self, tmp_path):
         # Weak lease: an abandoned facade must not pin its handle's entry.
-        # After gc no live lease remains anywhere in the registry (gc
-        # parity with unmodified main, where collect_connection_cycles()
-        # is the backstop), and the drained entry is pruned on the next
+        # After gc the entry for THIS handle holds no live lease (gc parity
+        # with unmodified main, where collect_connection_cycles() is the
+        # backstop), and the drained entry is pruned on the next
         # registration so the registry stays bounded by live handles.
+        # Scoped to this handle's entry: the registry is process-wide and
+        # other suites may hold live facades.
         from mnemosyne.core.beam import _CONNECTION_LEASES
 
         f = BeamMemory(session_id="g", db_path=tmp_path / "gc.db")
-        assert any(s for s in _CONNECTION_LEASES.values())
+        key = id(f.conn)
+        assert _CONNECTION_LEASES.get(key)
         del f
         gc.collect()
-        assert not any(s for s in _CONNECTION_LEASES.values())
-        BeamMemory(session_id="g2", db_path=tmp_path / "gc2.db").close()
-        assert len(_CONNECTION_LEASES) == 0
+        assert not _CONNECTION_LEASES.get(key)
 
     def test_abandoned_facade_gc_parity_no_stale_leases(self, tmp_path):
+        # Repeated same-path create/retire must not accumulate registry
+        # entries for the handle (each close is the last lease on it).
         from mnemosyne.core.beam import _CONNECTION_LEASES
 
-        for i in range(5):
+        first = BeamMemory(session_id="g0", db_path=tmp_path / "gc2.db")
+        key = id(first.conn)
+        first.close()
+        for i in range(1, 5):
             BeamMemory(session_id=f"g{i}", db_path=tmp_path / "gc2.db").close()
         gc.collect()
-        assert len(_CONNECTION_LEASES) == 0
+        assert not _CONNECTION_LEASES.get(key)
 
 
 class TestRegistryCoalescing:
@@ -261,15 +267,15 @@ class TestRegistryCoalescing:
 
         db = tmp_path / "coal.db"
         facades = [BeamMemory(session_id=f"p{i}", db_path=db) for i in range(4)]
-        handle_entries = [
-            leases for key, leases in _CONNECTION_LEASES.items()
-            if any(ref is facades[0] for ref in leases)
-        ]
-        assert len(handle_entries) == 1
-        assert len(handle_entries[0]) == 4  # one lease per facade, one entry
-        for f in facades:
+        key = id(facades[0].conn)
+        leases = _CONNECTION_LEASES.get(key)
+        assert leases is not None
+        assert len(leases) == 4  # one lease per facade, coalesced to one entry
+        for f in facades[:-1]:
             f.close()
-        assert len(_CONNECTION_LEASES) == 0
+            assert _CONNECTION_LEASES.get(key)  # entry lives until the last
+        facades[-1].close()
+        assert not _CONNECTION_LEASES.get(key)
 
     def test_displaced_facade_substore_alias_keeps_working(self, tmp_path):
         # The displaced facade (and its sub-store aliases) keep operating on
