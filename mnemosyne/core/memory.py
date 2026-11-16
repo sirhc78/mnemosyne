@@ -36,6 +36,13 @@ from mnemosyne.core.beam import (
     _deferred_commits,
 )
 from mnemosyne.core.journal import journal_mode
+from mnemosyne.core.retirement import (
+    register_connection,
+    acquire_lease,
+    is_retired,
+    release_lease,
+    retire_connection,
+)
 
 
 def _atomic_import(method):
@@ -285,6 +292,10 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         except Exception:
             pass
         _thread_local.db_path = str(path)
+        # mnemosyne#1163: register the new handle with the connection-
+        # retirement lease registry at connect time only (cache hits above
+        # never re-register). Idempotent per connection object.
+        register_connection(_thread_local.conn)
         collect_connection_cycles()
     # BeamMemory consults its own TLS cache during construction. Re-publish on
     # every successful core lookup, not only reconnection, because a standalone
@@ -445,6 +456,12 @@ class Mnemosyne:
 
         init_db(self.db_path)
         self.conn = _get_connection(self.db_path)
+        # mnemosyne#1163: register (idempotent) and lease the shared
+        # connection for this wrapper. The BeamMemory constructed below
+        # takes its own facade lease plus one per substore; the physical
+        # close runs only when the final lease is released.
+        register_connection(self.conn)
+        acquire_lease(self.conn)
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None
@@ -462,6 +479,60 @@ class Mnemosyne:
         # ``self.conn`` remains the core module cache. _get_connection
         # coordinates it with BEAM, preserving core connection identity while
         # direct wrappers dual-write through one transaction-capable handle.
+
+    def close(self, *, force: bool = False) -> None:
+        """Retire this wrapper's lease, then the beam facade (mnemosyne#1163).
+
+        Never commits. If a transaction is open on the shared connection the
+        close DEFERS by default (warning logged, connection stays open,
+        retry allowed); ``force=True`` rolls back and proceeds. The wrapper
+        lease is released first; ``self.beam.close`` releases the facade and
+        substore leases and runs the physical close sequence when the count
+        on the shared connection object reaches zero.
+
+        Idempotent; safe from any thread and after external closes.
+        """
+        conn = getattr(self, "conn", None)
+        if conn is None or is_retired(conn):
+            # Still forward to the beam facade so its leases are released
+            # even when the shared handle is already gone.
+            try:
+                self.beam.close(force=force)
+            except Exception:
+                logger.info("retirement: beam close failed", exc_info=True)
+            return
+        try:
+            in_txn = bool(conn.in_transaction)
+        except sqlite3.ProgrammingError:
+            # Externally closed: treat as already retired, release state.
+            release_lease(conn)
+            retire_connection(conn)
+            try:
+                self.beam.close(force=force)
+            except Exception:
+                logger.info("retirement: beam close failed", exc_info=True)
+            return
+        except Exception:
+            in_txn = False
+        if in_txn:
+            if force:
+                try:
+                    conn.rollback()
+                    logger.info("retirement: forced rollback of open transaction")
+                except Exception:
+                    logger.info("retirement: forced rollback failed", exc_info=True)
+            else:
+                logger.warning(
+                    "retirement deferred: transaction open on conn id=%d "
+                    "(retry after the transaction ends, or close(force=True)",
+                    id(conn),
+                )
+                return
+        release_lease(conn)
+        try:
+            self.beam.close(force=force)
+        except Exception:
+            logger.info("retirement: beam close failed", exc_info=True)
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 

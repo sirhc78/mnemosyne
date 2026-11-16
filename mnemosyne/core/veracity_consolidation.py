@@ -31,6 +31,7 @@ import threading
 import time
 import unicodedata
 from mnemosyne.core.journal import journal_mode
+from mnemosyne.core.retirement import acquire_lease, release_lease
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -318,6 +319,10 @@ class VeracityConsolidator:
                 pass
         self.conn.row_factory = sqlite3.Row
         self._owns_connection = conn is None
+        if conn is not None:
+            # mnemosyne#1163: shared conn -- take one lease; close() below
+            # only releases the lease (never closes a peer's connection).
+            acquire_lease(conn)
         # Federation handshake opt-in/out for this instance. Resolved lazily
         # per conflict row (never frozen at construction) so an env change
         # takes effect without rebuilding the consolidator, and so the
@@ -1212,8 +1217,21 @@ class VeracityConsolidator:
         }
     
     def close(self):
-        """Close database connection."""
-        self.conn.close()
+        """Close database connection (mnemosyne#1163 lease-aware).
+
+        With a private connection (``_owns_connection``) this closes it as
+        before. With a shared connection this releases only this store's
+        lease; the peer that owns the final lease runs the physical close.
+        """
+        if getattr(self, "_owns_connection", False):
+            self.conn.close()
+        else:
+            # Shared conn: release only this store's lease. The flag makes
+            # the later facade close() skip this store (no double release
+            # under either release order -- mnemosyne#1163).
+            if not getattr(self, "_lease_released", False):
+                self._lease_released = True
+                release_lease(self.conn)
 
 
 # --- Testing ---

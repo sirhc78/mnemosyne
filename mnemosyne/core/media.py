@@ -47,6 +47,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import logging
 
+from mnemosyne.core.retirement import acquire_lease
+
 logger = logging.getLogger(__name__)
 
 
@@ -663,6 +665,9 @@ class MediaStore:
         if conn is not None:
             self.conn = conn
             _init_media_with_conn(conn)
+            # mnemosyne#1163: take one lease on the shared connection; the
+            # holder of the final lease runs the physical close.
+            acquire_lease(conn)
         else:
             init_media(self.db_path)
             self.conn = _get_conn(self.db_path)

@@ -85,6 +85,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from mnemosyne.core.retirement import acquire_lease
+
 
 # Default DB location. Mirrors BeamMemory's default (the main mnemosyne.db) so a
 # standalone CanonicalStore() lands in the same database the provider wires it
@@ -227,6 +229,9 @@ class CanonicalStore:
         if conn is not None:
             self.conn = conn
             _init_canonical_with_conn(conn)
+            # mnemosyne#1163: take one lease on the shared connection; the
+            # holder of the final lease runs the physical close.
+            acquire_lease(conn)
         else:
             init_canonical(self.db_path)
             self.conn = _get_conn(self.db_path)

@@ -24,6 +24,8 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
+from mnemosyne.core.retirement import acquire_lease, release_lease
+
 
 # Subjects that the crude "X is/has/uses Y" regexes below capture from
 # conversational prose but that are never durable facts. A bare
@@ -220,6 +222,10 @@ class EpisodicGraph:
             self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._owns_connection = conn is None
+        if conn is not None:
+            # mnemosyne#1163: shared conn -- take one lease; close() below
+            # only releases the lease (never closes a peer's connection).
+            acquire_lease(conn)
         self._init_tables()
     
     def _init_tables(self):
@@ -688,8 +694,21 @@ class EpisodicGraph:
         }
     
     def close(self):
-        """Close database connection."""
-        self.conn.close()
+        """Close database connection (mnemosyne#1163 lease-aware).
+
+        With a private connection (``_owns_connection``) this closes it as
+        before. With a shared connection this releases only this store's
+        lease; the peer that owns the final lease runs the physical close.
+        """
+        if getattr(self, "_owns_connection", False):
+            self.conn.close()
+        else:
+            # Shared conn: release only this store's lease. The flag makes
+            # the later facade close() skip this store (no double release
+            # under either release order -- mnemosyne#1163).
+            if not getattr(self, "_lease_released", False):
+                self._lease_released = True
+                release_lease(self.conn)
 
 
 # --- Testing ---

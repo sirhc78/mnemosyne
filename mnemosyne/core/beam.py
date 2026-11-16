@@ -32,6 +32,13 @@ from mnemosyne.core.config import resolve_beam_runtime
 from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 from mnemosyne.core.journal import journal_mode
 from mnemosyne.core.recall_provenance import append_recall_provenance
+from mnemosyne.core.retirement import (
+    acquire_lease,
+    is_retired,
+    register_connection,
+    release_lease,
+    retire_connection,
+)
 from mnemosyne.core.sqlite_config import configure_busy_timeout
 
 logger = logging.getLogger(__name__)
@@ -1339,9 +1346,14 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
                 )
         else:
             conn._mnemosyne_vec_loaded = False
+        # mnemosyne#1163: first sight of this handle -- register it with the
+        # connection-retirement lease registry (idempotent; cache hits above
+        # never re-register). Facades/substores lease this exact object and
+        # the physical close runs on final lease release (identity-keyed).
+        register_connection(conn)
+        collect_connection_cycles()
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
-        collect_connection_cycles()
     return _thread_local.conn
 
 
@@ -6382,6 +6394,119 @@ class BeamMemory:
                 self.veracity_consolidator = VeracityConsolidator(conn=self.conn, db_path=self.db_path)
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
+
+        # mnemosyne#1163: register the shared connection (idempotent) and
+        # take ONE lease for this facade. Each substore constructed above
+        # with conn=self.conn took its own lease inside its __init__; the
+        # connection is physically closed only when the final lease is
+        # released (see BeamMemory.close).
+        register_connection(self.conn)
+        acquire_lease(self.conn)
+        self._leases_released = False
+
+    def close(self, *, force: bool = False) -> None:
+        """Retire this facade's lease on the shared connection (mnemosyne#1163).
+
+        Never commits. If a transaction is open on the connection the close
+        DEFERS by default: a warning is logged, the connection stays open and
+        a retry is allowed. ``force=True`` rolls back the open transaction
+        and proceeds; the default path never commits or rolls back.
+
+        When this release drops the lease count to zero (no peer facade or
+        substore still holds a lease on the same connection object) the
+        physical close sequence runs: cancel pending state (best-effort),
+        close the query cache (best-effort, it owns a private connection),
+        ``conn.close()`` (sqlite close rolls back residue, never commits) and
+        ``retire_connection`` (marks retired, scrubs TLS caches by identity).
+
+        Safe to call twice, from any thread, and after external closes of
+        the connection (treated as already retired; registry state is
+        released anyway).
+        """
+        if getattr(self, "_leases_released", False):
+            return  # already closed once; never touch peer leases again
+        conn = getattr(self, "conn", None)
+        if conn is None or is_retired(conn):
+            self._leases_released = True
+            return
+        try:
+            in_txn = bool(conn.in_transaction)
+        except sqlite3.ProgrammingError:
+            # Already closed externally (conftest-style): treat as retired,
+            # release registry state anyway.
+            self._leases_released = True
+            release_lease(conn)
+            retire_connection(conn)
+            return
+        except Exception:
+            in_txn = False
+        if in_txn:
+            if force:
+                try:
+                    conn.rollback()
+                    logger.info("retirement: forced rollback of open transaction")
+                except Exception:
+                    logger.info("retirement: forced rollback failed", exc_info=True)
+            else:
+                logger.warning(
+                    "retirement deferred: transaction open on beam conn id=%d "
+                    "(call close() again after the transaction ends, or "
+                    "close(force=True) to roll back and proceed)",
+                    id(conn),
+                )
+                return
+        # Cancel pending state on the connection (after-commit hooks and
+        # savepoint marks) -- best-effort.
+        try:
+            hooks = getattr(conn, "_after_commit_hooks", None)
+            if hooks is not None:
+                hooks.clear()
+            marks = getattr(conn, "_savepoint_hook_marks", None)
+            if marks is not None:
+                marks.clear()
+        except Exception:
+            logger.info("retirement: cancel pending state failed", exc_info=True)
+        # Release the five substore leases taken in __init__ on this exact
+        # connection object (annotations, canonical, media, episodic_graph,
+        # veracity_consolidator), then the facade lease. Skip a substore
+        # only when it is absent or wired to a different connection, or when
+        # it already released its own lease (its close() ran first -- the
+        # "both release orders" control: substore.close() then facade.close()
+        # must not double-release and drift the count into underflow).
+        for name in (
+            "annotations",
+            "canonical",
+            "media",
+            "episodic_graph",
+            "veracity_consolidator",
+        ):
+            store = getattr(self, name, None)
+            if store is None or getattr(store, "conn", None) is not conn:
+                continue
+            if getattr(store, "_lease_released", False):
+                continue
+            try:
+                store._lease_released = True
+            except Exception:
+                pass
+            release_lease(conn)
+        self._leases_released = True
+        if not release_lease(conn):
+            # Peer facades/substores still lease this exact object.
+            return
+        # Final release: query cache owns a separate private connection;
+        # close it best-effort before the physical close of the shared conn.
+        cache = getattr(self, "_query_cache", None)
+        if cache is not None:
+            try:
+                cache.close()
+            except Exception:
+                logger.warning("retirement: query cache close failed", exc_info=True)
+        try:
+            conn.close()
+        except Exception:
+            logger.info("retirement: conn.close() failed", exc_info=True)
+        retire_connection(conn)
 
     # ------------------------------------------------------------------
     # E6 schema split + auto-migration

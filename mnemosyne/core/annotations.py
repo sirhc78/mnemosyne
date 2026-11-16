@@ -29,6 +29,8 @@ import sqlite3
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from mnemosyne.core.retirement import acquire_lease
+
 
 DEFAULT_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
 
@@ -221,6 +223,9 @@ class AnnotationStore:
             self.conn = conn
             # Ensure schema exists on the shared connection — idempotent.
             _init_annotations_with_conn(conn)
+            # mnemosyne#1163: take one lease on the shared connection; the
+            # holder of the final lease runs the physical close.
+            acquire_lease(conn)
         else:
             init_annotations(self.db_path)
             self.conn = _get_conn(self.db_path)
