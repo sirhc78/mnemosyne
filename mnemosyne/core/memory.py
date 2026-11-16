@@ -465,6 +465,20 @@ class Mnemosyne:
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 
+    def close(self, force: bool = False) -> None:
+        """Retire this facade; delegates to its beam facade (mnemosyne#1163).
+
+        One lease per facade pair: Mnemosyne holds no lease of its own, so a
+        same-handle peer stays usable, and the handle closes only when this
+        beam facade held the last live lease.
+        """
+        self.beam.close(force=force)
+
+    @property
+    def is_closed(self) -> bool:
+        """True once this facade's beam lease has retired (mnemosyne#1163)."""
+        return self.beam.is_closed
+
     @property
     def stream(self):
         """Lazy-initialized memory event stream."""

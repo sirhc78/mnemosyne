@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import sys
 import logging
 import sqlite3
 import json
 import hashlib
 import threading
+import weakref
 import time
 import math
 import operator
@@ -1288,6 +1290,80 @@ def _episodic_recall_where(
 VEC_TYPE = os.environ.get("MNEMOSYNE_VEC_TYPE", "int8").lower()
 if VEC_TYPE not in ("float32", "int8", "bit"):
     VEC_TYPE = "float32"
+
+
+_CONNECTION_LEASES: Dict[int, "weakref.WeakSet[Any]"] = {}
+_CONNECTION_LEASE_LOCK = threading.Lock()
+
+
+def _connection_leases_for(conn: sqlite3.Connection) -> "weakref.WeakSet[Any]":
+    """Return (creating on first use) the live leases on one connection object.
+
+    Leases are weak references to facades, never to the connection, so the
+    registry can never itself keep a handle alive. Keyed by ``id(conn)``
+    because ``sqlite3.Connection`` is unhashable. An entry whose WeakSet has
+    drained is semantically identical to no entry, so stale ones are pruned
+    when a fresh entry is created -- the registry stays bounded by live
+    handles instead of growing with every generation (mnemosyne#1163).
+    """
+    key = id(conn)
+    with _CONNECTION_LEASE_LOCK:
+        leases = _CONNECTION_LEASES.get(key)
+        if leases is None:
+            for stale in [k for k, s in _CONNECTION_LEASES.items() if not s]:
+                del _CONNECTION_LEASES[stale]
+            leases = weakref.WeakSet()
+            _CONNECTION_LEASES[key] = leases
+    return leases
+
+
+def _lease_register(facade: Any, conn: sqlite3.Connection) -> None:
+    """Register one facade's weak lease on the exact handle it was built on."""
+    _connection_leases_for(conn).add(facade)
+
+
+def _lease_release(facade: Any, conn: sqlite3.Connection) -> bool:
+    """Drop one facade's lease. True when this was the last live lease.
+
+    The weak registry may already have discarded an unreachable facade's
+    lease; that path releases too (gc parity with unmodified main, where an
+    abandoned facade never closes anything itself).
+    """
+    with _CONNECTION_LEASE_LOCK:
+        leases = _CONNECTION_LEASES.get(id(conn))
+        if leases is None:
+            return False
+        leases.discard(facade)
+        if leases:
+            return False
+        del _CONNECTION_LEASES[id(conn)]
+    return True
+
+
+def _connection_retire(conn: sqlite3.Connection) -> None:
+    """Last-lease release: close the handle, then scrub identity-scoped caches.
+
+    TLS slots are cleared only where they hold this exact object (both
+    core.beam and core.memory, via sys.modules -- never an import, which
+    would run init_db() and displace a handle). A newer generation
+    reconnected to the same path is a different object and is untouched;
+    other threads' slots self-heal through the SELECT 1 liveness probe in
+    _get_connection (C3, mnemosyne#1163).
+    """
+    with _CONNECTION_LEASE_LOCK:
+        _CONNECTION_LEASES.pop(id(conn), None)
+    try:
+        conn.close()
+    except Exception:
+        logger.warning("retired connection close failed", exc_info=True)
+    for module_name in ("mnemosyne.core.beam", "mnemosyne.core.memory"):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        cache = getattr(module, "_thread_local", None)
+        if cache is not None and getattr(cache, "conn", None) is conn:
+            cache.conn = None
+            cache.db_path = None
 
 
 def _get_connection(db_path: Path = None) -> sqlite3.Connection:
@@ -6328,6 +6404,8 @@ class BeamMemory:
         self.db_path = self.db_path.expanduser().resolve()
         self.init_result = init_beam(self.db_path)
         self.conn = _get_connection(self.db_path)
+        self._closed = False
+        _lease_register(self, self.conn)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
@@ -6382,6 +6460,49 @@ class BeamMemory:
                 self.veracity_consolidator = VeracityConsolidator(conn=self.conn, db_path=self.db_path)
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Connection retirement (mnemosyne#1163)
+    # ------------------------------------------------------------------
+    @property
+    def is_closed(self) -> bool:
+        """True once this facade has retired its lease (mnemosyne#1163)."""
+        return self._closed
+
+    def close(self, force: bool = False) -> None:
+        """Retire this facade's lease on its connection (mnemosyne#1163).
+
+        Idempotent, never raises on cleanup, callable from any thread. While
+        the connection reports ``in_transaction`` the call refuses with
+        ``MemoryTransactionStateError`` and changes nothing -- the caller
+        keeps full commit/rollback authority and may retry. ``force=True``
+        is the explicit discard: rollback, then retire.
+
+        Dropping the lease closes the handle only when no other live lease
+        (same-path peer, external facade, sub-store alias) remains; peers
+        keep using the handle. ``self.conn`` stays referenced because the
+        repo idiom (``.conn.close()`` at ~190 call sites) relies on
+        sqlite's idempotent close; ``is_closed`` is the retirement signal.
+        """
+        if self._closed:
+            return
+        try:
+            in_transaction = bool(self.conn.in_transaction)
+        except Exception:
+            in_transaction = False  # handle already dead; nothing to fence
+        if in_transaction:
+            if not force:
+                raise MemoryTransactionStateError(
+                    "close() refused: connection has an open transaction "
+                    "(commit or rollback first, or pass force=True to discard)"
+                )
+            try:
+                self.conn.rollback()
+            except Exception:
+                logger.warning("forced close rollback failed", exc_info=True)
+        self._closed = True
+        if _lease_release(self, self.conn):
+            _connection_retire(self.conn)
 
     # ------------------------------------------------------------------
     # E6 schema split + auto-migration

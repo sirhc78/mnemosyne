@@ -688,7 +688,14 @@ class EpisodicGraph:
         }
     
     def close(self):
-        """Close database connection."""
+        """Close database connection.
+
+        Only the owner closes: when this graph rides a caller-supplied
+        handle (``_owns_connection`` False), closing here would kill a
+        shared beam handle the graph does not own (mnemosyne#1163).
+        """
+        if not getattr(self, "_owns_connection", False):
+            return
         self.conn.close()
 
 

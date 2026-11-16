@@ -1212,7 +1212,14 @@ class VeracityConsolidator:
         }
     
     def close(self):
-        """Close database connection."""
+        """Close database connection.
+
+        Only the owner closes: when this consolidator rides a
+        caller-supplied handle (``_owns_connection`` False), closing here
+        would kill a shared beam handle it does not own (mnemosyne#1163).
+        """
+        if not getattr(self, "_owns_connection", False):
+            return
         self.conn.close()
 
 
